@@ -1,0 +1,788 @@
+openapi: 3.1.0
+info:
+  title: Arbitrum Earn API
+  version: 0.3.0
+  description: |
+    Public REST API for discovering and interacting with Earn yield
+    opportunities across supported Arbitrum-connected networks.
+
+    Opportunities are aggregated across three vendors:
+      * **Vaults** (`vaults`) — lending (category `lend`)
+      * **LiFi** (`lifi`) — liquid staking (category `liquid-staking`)
+      * **Pendle** (`pendle`) — fixed-yield (category `fixed-yield`)
+
+    All endpoints are unauthenticated `GET` requests. Write actions are
+    returned as pre-built, unsigned transaction steps that the client
+    signs and submits on-chain.
+
+    ## Typical call flow
+
+    <img
+      alt="Earn API call flow"
+      src="https://mermaid.ink/svg/Zmxvd2NoYXJ0IExSCiAgQVsiR0VUIC9vcHBvcnR1bml0aWVzPGJyLz48aT5kaXNjb3ZlciB5aWVsZHM8L2k+Il0gLS0+IEJbIkdFVCAvb3Bwb3J0dW5pdHkvY2F0ZWdvcnkvaWQ8YnIvPjxpPmluc3BlY3QgZGV0YWlsczwvaT4iXQogIEIgLS4gb3B0aW9uYWwgLi0+IEhbIkdFVCAuLi4vaGlzdG9yaWNhbC1kYXRhPGJyLz48aT5BUFkgLyBUVkwgLyBwcmljZTwvaT4iXQogIEIgLS0+IENbIkdFVCAuLi4vYXZhaWxhYmxlLWFjdGlvbnM8YnIvPjxpPndoYXQgY2FuIHRoZSB1c2VyIGRvPzwvaT4iXQogIEMgLS0+IERbIkdFVCAuLi4vdHJhbnNhY3Rpb24tcXVvdGU8YnIvPjxpPnVuc2lnbmVkIHR4ICsgZ2FzPC9pPiJdCiAgRCAtLT4gRSgoIkNsaWVudCBzaWduczxici8+YW5kIHN1Ym1pdHMiKSkKICBFIC0tPiBGWyJHRVQgL3Bvc2l0aW9uczxici8+PGk+aG9sZGluZ3MgLyBuZXQgQVBZPC9pPiJdCiAgRSAtLT4gR1siR0VUIC4uLi90cmFuc2FjdGlvbnM8YnIvPjxpPm9uLWNoYWluIGhpc3Rvcnk8L2k+Il0K?theme=dark"
+      style="max-width: 720px; width: 100%; height: auto;"
+    />
+
+    1. **Discover** — `GET /opportunities` returns a ranked list across all
+       vendors. Filter by `category`, `chainId`, `minTvl`, or `minApy`.
+    2. **Inspect** — `GET /opportunity/{category}/{id}` for a single
+       opportunity's full detail; `/historical-data` for time-series.
+    3. **Check what's possible** — `GET /opportunity/{category}/{id}/available-actions`
+       returns the subset of `deposit` / `redeem` / `swap` / `enter` / `exit` /
+       `rollover` / `claim` that's valid for the caller, plus balances and
+       (for fixed-yield) rollover targets.
+    4. **Quote** — `GET /opportunity/{category}/{id}/transaction-quote`
+       with an `action` + `amount` returns an ordered list of unsigned
+       transaction steps (approvals + the action itself), gas estimates,
+       and a pending-history template.
+    5. **Sign & submit** — the client signs each step and broadcasts it;
+       the API is never involved in signing.
+    6. **Read back** — `GET /positions` and
+       `GET /opportunity/{category}/{id}/transactions` reflect on-chain state.
+
+servers:
+  - url: https://portal.arbitrum.io/api/onchain-actions/v1/earn
+    description: Production
+
+paths:
+  /opportunities:
+    get:
+      summary: List yield opportunities
+      description: |
+        Returns a ranked, capped list (max 50) of yield opportunities
+        aggregated across supported vendors. Results are sorted by
+        `rawApy` by default and filtered by the supplied query params.
+      parameters:
+        - in: query
+          name: category
+          description: Restrict results to a single category. Omit for all.
+          schema: { $ref: '#/components/schemas/OpportunityCategory' }
+        - in: query
+          name: chainId
+          description: EVM chain id. Omit for all supported Earn chains.
+          schema: { $ref: '#/components/schemas/EarnChainId' }
+        - in: query
+          name: minTvl
+          description: Minimum TVL in USD.
+          schema: { type: number, minimum: 0, example: 1000000 }
+        - in: query
+          name: minApy
+          description: Minimum APY as a decimal (0.05 = 5%).
+          schema: { type: number, minimum: 0, example: 0.05 }
+        - in: query
+          name: orderBy
+          schema:
+            type: string
+            enum: [rawApy, rawTvl]
+            default: rawApy
+      responses:
+        '200':
+          description: A ranked, capped list of opportunities.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpportunitiesResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /positions:
+    get:
+      summary: Get a user's positions
+      description: |
+        Returns all open positions for a user address across vendors,
+        plus aggregate metrics (total value, projected earnings, net APY,
+        and breakdowns by category and vendor).
+      parameters:
+        - in: query
+          name: userAddress
+          required: true
+          schema: { $ref: '#/components/schemas/EthAddress' }
+        - in: query
+          name: chainId
+          required: true
+          schema: { $ref: '#/components/schemas/EarnChainId' }
+        - in: query
+          name: category
+          description: Restrict to a single category. Omit for all.
+          schema: { $ref: '#/components/schemas/OpportunityCategory' }
+      responses:
+        '200':
+          description: User positions with aggregate metrics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPositionsResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /opportunity/{category}/{id}:
+    get:
+      summary: Get opportunity details
+      parameters:
+        - $ref: '#/components/parameters/CategoryPath'
+        - $ref: '#/components/parameters/OpportunityIdPath'
+        - in: query
+          name: chainId
+          required: true
+          schema: { $ref: '#/components/schemas/EarnChainId' }
+      responses:
+        '200':
+          description: A single opportunity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Opportunity' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /opportunity/{category}/{id}/historical-data:
+    get:
+      summary: Historical APY / TVL / price series
+      description: |
+        Returns time-series data for an opportunity. Either supply
+        `range` (defaults to `7d`) or an explicit `from`/`to` window
+        (both required together). Granularity is inferred from the
+        window size.
+      parameters:
+        - $ref: '#/components/parameters/CategoryPath'
+        - $ref: '#/components/parameters/OpportunityIdPath'
+        - in: query
+          name: chainId
+          required: true
+          schema: { $ref: '#/components/schemas/EarnChainId' }
+        - in: query
+          name: range
+          description: Preset window. Ignored when `from`/`to` are supplied.
+          schema: { $ref: '#/components/schemas/HistoricalTimeRange' }
+        - in: query
+          name: from
+          description: Window start. Unix seconds/ms, or ISO-8601 datetime. Must be paired with `to`.
+          schema: { type: string, example: '1735689600' }
+        - in: query
+          name: to
+          description: Window end. Unix seconds/ms, or ISO-8601 datetime. Must be paired with `from`.
+          schema: { type: string, example: '1736294400' }
+        - in: query
+          name: assetSymbol
+          description: Optional asset symbol hint for vendors that disambiguate by symbol.
+          schema: { type: string, maxLength: 64 }
+      responses:
+        '200':
+          description: Time-series data for the requested window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HistoricalData' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFoundError' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /opportunity/{category}/{id}/transactions:
+    get:
+      summary: User's on-chain transaction history for an opportunity
+      parameters:
+        - $ref: '#/components/parameters/CategoryPath'
+        - $ref: '#/components/parameters/OpportunityIdPath'
+        - in: query
+          name: chainId
+          required: true
+          schema: { $ref: '#/components/schemas/EarnChainId' }
+        - in: query
+          name: userAddress
+          required: true
+          schema: { $ref: '#/components/schemas/EthAddress' }
+      responses:
+        '200':
+          description: Transaction history for the user on this opportunity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionHistoryResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /opportunity/{category}/{id}/available-actions:
+    get:
+      summary: Actions a user can perform on an opportunity
+      description: |
+        Returns the list of `EarnTransactionAction` values that are
+        currently valid for this user/opportunity pair, along with
+        any context the client needs to pre-fill the action UI
+        (balances, LP token metadata, rollover targets).
+      parameters:
+        - $ref: '#/components/parameters/CategoryPath'
+        - $ref: '#/components/parameters/OpportunityIdPath'
+        - in: query
+          name: chainId
+          required: true
+          schema: { $ref: '#/components/schemas/EarnChainId' }
+        - in: query
+          name: userAddress
+          required: true
+          schema: { $ref: '#/components/schemas/EthAddress' }
+      responses:
+        '200':
+          description: Available actions and transaction context.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AvailableActions' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /opportunity/{category}/{id}/transaction-quote:
+    get:
+      summary: Build an unsigned transaction quote
+      description: |
+        Returns an ordered list of unsigned transaction steps
+        (approvals + the action itself) for the client to sign and
+        submit. Also returns gas estimates and pre-built templates
+        the UI can use for the pending/confirmed transaction popups.
+      parameters:
+        - $ref: '#/components/parameters/CategoryPath'
+        - $ref: '#/components/parameters/OpportunityIdPath'
+        - in: query
+          name: action
+          required: true
+          schema: { $ref: '#/components/schemas/EarnTransactionAction' }
+        - in: query
+          name: amount
+          required: true
+          description: Amount in the input token's base units, as a positive integer string (digits only, > 0).
+          schema: { type: string, pattern: '^[1-9][0-9]*$', example: '1000000' }
+        - in: query
+          name: chainId
+          required: true
+          schema: { $ref: '#/components/schemas/EarnChainId' }
+        - in: query
+          name: userAddress
+          schema: { $ref: '#/components/schemas/EthAddress' }
+        - in: query
+          name: inputTokenAddress
+          schema: { $ref: '#/components/schemas/EthAddress' }
+        - in: query
+          name: outputTokenAddress
+          schema: { $ref: '#/components/schemas/EthAddress' }
+        - in: query
+          name: slippage
+          description: Slippage tolerance as a percentage (0–100).
+          schema: { type: number, minimum: 0, maximum: 100, example: 0.5 }
+        - in: query
+          name: simulate
+          description: If true, vendors that support simulation will dry-run the transaction before returning.
+          schema: { type: boolean }
+        - in: query
+          name: rolloverTargetOpportunityId
+          description: For `rollover` actions — the target opportunity (as an Ethereum address).
+          schema: { $ref: '#/components/schemas/EthAddress' }
+        - in: query
+          name: rolloverAmount
+          description: For `rollover` actions — the amount to roll over, in base units (positive integer string, > 0).
+          schema: { type: string, pattern: '^[1-9][0-9]*$' }
+      responses:
+        '200':
+          description: Unsigned transaction steps and metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionQuoteResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+  parameters:
+    CategoryPath:
+      in: path
+      name: category
+      required: true
+      schema: { $ref: '#/components/schemas/OpportunityCategory' }
+    OpportunityIdPath:
+      in: path
+      name: id
+      required: true
+      description: Opportunity id. Must be a valid Ethereum address.
+      schema: { $ref: '#/components/schemas/EthAddress' }
+
+  schemas:
+    EthAddress:
+      type: string
+      pattern: '^0x[a-fA-F0-9]{40}$'
+      example: '0xabc0000000000000000000000000000000000000'
+
+    EarnChainId:
+      type: integer
+      description: Supported Earn chain ids. 42161 = Arbitrum One, 1 = Ethereum.
+      enum: [42161, 1]
+      example: 42161
+
+    OpportunityCategory:
+      type: string
+      enum: [lend, liquid-staking, fixed-yield]
+      example: lend
+
+    Vendor:
+      type: string
+      enum: [vaults, lifi, pendle]
+
+    EarnTransactionAction:
+      type: string
+      enum: [deposit, redeem, swap, enter, exit, rollover, claim]
+
+    HistoricalTimeRange:
+      type: string
+      enum: [1d, 7d, 1m, 1y]
+      default: 7d
+
+    HistoricalGranularity:
+      type: string
+      enum: [1hour, 1day, 1week]
+
+    ApyBreakdown:
+      type: object
+      properties:
+        base: { type: number, example: 0.031 }
+        reward: { type: number, example: 0.011 }
+        total: { type: number, example: 0.042 }
+
+    OpportunityMetrics:
+      type: object
+      required: [rawApy, rawTvl, deposited, depositedUsd, projectedEarningsUsd]
+      properties:
+        rawApy: { type: [number, 'null'], example: 0.0421 }
+        rawTvl: { type: [number, 'null'], example: 12450000 }
+        deposited:
+          type: [string, 'null']
+          description: User's deposited amount in the vault's base units (integer string).
+        depositedUsd: { type: [number, 'null'] }
+        projectedEarningsUsd: { type: [number, 'null'] }
+        maturityDate:
+          type: string
+          description: ISO-8601 date. Present for fixed-yield opportunities.
+        apyBreakdown: { $ref: '#/components/schemas/ApyBreakdown' }
+
+    LendDetail:
+      type: object
+      required: [protocolName, networkName]
+      properties:
+        protocolName: { type: string, example: Aave }
+        networkName: { type: string, example: arbitrum }
+        tvlUsd: { type: number }
+        assetSymbol: { type: string, example: USDC }
+        assetLogo: { type: string, format: uri }
+        assetAddress: { $ref: '#/components/schemas/EthAddress' }
+        protocolLogo: { type: string, format: uri }
+        description: { type: string }
+        stakersCount: { type: integer }
+        apy30day: { type: number }
+        apy7day: { type: number }
+
+    SettlementToken:
+      type: object
+      required: [symbol, address, decimals]
+      properties:
+        symbol: { type: string }
+        address: { $ref: '#/components/schemas/EthAddress' }
+        decimals: { type: integer }
+        logoUrl: { type: string, format: uri }
+
+    FixedYieldDetail:
+      type: object
+      required: [pt, detailsTvlUsd, detailsImpliedApy]
+      properties:
+        pt: { type: string, description: 'Principal Token address.' }
+        detailsTvlUsd: { type: [number, 'null'] }
+        detailsImpliedApy: { type: [number, 'null'] }
+        expiry: { type: string, description: 'ISO-8601 date.' }
+        detailsUnderlyingApy: { type: [number, 'null'] }
+        detailsLiquidityUsd: { type: number }
+        detailsTradingVolumeUsd: { type: number }
+        ptTokenIcon: { type: string, format: uri }
+        ptTokenDecimals: { type: integer }
+        underlyingAsset: { type: string }
+        underlyingTokenDecimals: { type: integer }
+        sySupplyCap: { type: [number, 'null'] }
+        syCurrentSupply: { type: number }
+        settlementTokens:
+          type: array
+          items: { $ref: '#/components/schemas/SettlementToken' }
+
+    OpportunityBase:
+      type: object
+      required: [id, vendor, category, chainId, network, protocol, token, vaultAddress, metrics]
+      properties:
+        id:
+          type: string
+          description: |
+            Opportunity id. For vendor-built identifiers this is the lowercased
+            vault / market / PT address. Use this value as the `{id}` path
+            parameter on `/opportunity/...` endpoints.
+          example: '0xabc0000000000000000000000000000000000000'
+        vendor: { $ref: '#/components/schemas/Vendor' }
+        category: { $ref: '#/components/schemas/OpportunityCategory' }
+        chainId: { $ref: '#/components/schemas/EarnChainId' }
+        network: { type: string, example: arbitrum }
+        protocol: { type: string, example: Aave }
+        token: { type: string, example: USDC }
+        vaultAddress: { $ref: '#/components/schemas/EthAddress' }
+        metrics: { $ref: '#/components/schemas/OpportunityMetrics' }
+        name: { type: string, example: 'Aave USDC Supply' }
+        tokenIcon: { type: string, format: uri }
+        tokenNetwork: { type: string }
+        protocolIcon: { type: string, format: uri }
+
+    Opportunity:
+      description: |
+        Discriminated by `category`. Lend opportunities carry a `lend`
+        sub-object; fixed-yield opportunities carry a `fixedYield`
+        sub-object; liquid-staking opportunities have no additional
+        sub-object.
+      oneOf:
+        - $ref: '#/components/schemas/LendOpportunity'
+        - $ref: '#/components/schemas/LiquidStakingOpportunity'
+        - $ref: '#/components/schemas/FixedYieldOpportunity'
+      discriminator:
+        propertyName: category
+        mapping:
+          lend: '#/components/schemas/LendOpportunity'
+          liquid-staking: '#/components/schemas/LiquidStakingOpportunity'
+          fixed-yield: '#/components/schemas/FixedYieldOpportunity'
+
+    LendOpportunity:
+      allOf:
+        - $ref: '#/components/schemas/OpportunityBase'
+        - type: object
+          required: [category, lend]
+          properties:
+            category: { type: string, enum: [lend] }
+            lend: { $ref: '#/components/schemas/LendDetail' }
+
+    LiquidStakingOpportunity:
+      allOf:
+        - $ref: '#/components/schemas/OpportunityBase'
+        - type: object
+          required: [category]
+          properties:
+            category: { type: string, enum: [liquid-staking] }
+
+    FixedYieldOpportunity:
+      allOf:
+        - $ref: '#/components/schemas/OpportunityBase'
+        - type: object
+          required: [category, fixedYield]
+          properties:
+            category: { type: string, enum: [fixed-yield] }
+            fixedYield: { $ref: '#/components/schemas/FixedYieldDetail' }
+
+    OpportunitiesResponse:
+      type: object
+      required: [opportunities, total, vendors, categories]
+      properties:
+        opportunities:
+          type: array
+          items: { $ref: '#/components/schemas/Opportunity' }
+        total: { type: integer, example: 37 }
+        vendors:
+          type: array
+          items: { $ref: '#/components/schemas/Vendor' }
+        categories:
+          type: array
+          items: { $ref: '#/components/schemas/OpportunityCategory' }
+
+    UserPosition:
+      type: object
+      required:
+        [
+          opportunityId,
+          category,
+          vendor,
+          network,
+          amount,
+          valueUsd,
+          tokenAddress,
+          tokenSymbol,
+          tokenDecimals,
+          opportunity,
+        ]
+      properties:
+        opportunityId: { type: string }
+        category: { $ref: '#/components/schemas/OpportunityCategory' }
+        vendor: { $ref: '#/components/schemas/Vendor' }
+        network: { type: string }
+        amount: { type: string, description: 'Position amount in token base units.' }
+        valueUsd: { type: [number, 'null'] }
+        tokenAddress: { $ref: '#/components/schemas/EthAddress' }
+        tokenSymbol: { type: string }
+        tokenDecimals: { type: integer }
+        tokenIcon: { type: string, format: uri }
+        projectedEarningsUsd: { type: number }
+        opportunity:
+          type: object
+          required: [id, name, protocol, apy]
+          properties:
+            id: { type: string }
+            name: { type: string }
+            protocol: { type: string }
+            apy: { type: number }
+            tvl: { type: number }
+        isExpired: { type: boolean }
+        expiryDate: { type: string, description: 'ISO-8601 date.' }
+
+    CategoryValueSummary:
+      type: object
+      required: [count, valueUsd]
+      properties:
+        count: { type: integer }
+        valueUsd: { type: number }
+
+    UserPositionsResponse:
+      type: object
+      required:
+        [
+          userAddress,
+          positions,
+          totalValueUsd,
+          projectedEarningsUsd,
+          projectedEarningsMonthlyUsd,
+          projectedEarningsYearlyPercentage,
+          projectedEarningsMonthlyPercentage,
+          netApy,
+          categoryApy,
+          summary,
+        ]
+      properties:
+        userAddress: { $ref: '#/components/schemas/EthAddress' }
+        positions:
+          type: array
+          items: { $ref: '#/components/schemas/UserPosition' }
+        totalValueUsd: { type: number }
+        projectedEarningsUsd: { type: number }
+        projectedEarningsMonthlyUsd: { type: number }
+        projectedEarningsYearlyPercentage: { type: number }
+        projectedEarningsMonthlyPercentage: { type: number }
+        netApy: { type: number }
+        categoryApy:
+          type: object
+          description: Weighted APY per category, keyed by category.
+          additionalProperties: { type: number }
+        summary:
+          type: object
+          required: [byCategory, byVendor]
+          properties:
+            byCategory:
+              type: object
+              additionalProperties: { $ref: '#/components/schemas/CategoryValueSummary' }
+            byVendor:
+              type: object
+              additionalProperties: { $ref: '#/components/schemas/CategoryValueSummary' }
+        cachedAt: { type: integer, description: 'Unix ms.' }
+        expiresAt: { type: integer, description: 'Unix ms.' }
+        errors:
+          type: array
+          description: Per-category failures surfaced alongside partial results.
+          items:
+            type: object
+            required: [category, error]
+            properties:
+              category: { type: string }
+              error: { type: string }
+
+    HistoricalDataPoint:
+      type: object
+      required: [timestamp, apy, tvl, price]
+      properties:
+        timestamp: { type: integer, description: 'Unix seconds.' }
+        apy: { type: [number, 'null'] }
+        tvl: { type: [number, 'null'] }
+        price: { type: [number, 'null'] }
+
+    HistoricalData:
+      type: object
+      required:
+        [data, granularity, range, fromTimestamp, toTimestamp, isCached, lastFetchedAt, expiresAt]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/HistoricalDataPoint' }
+        granularity: { $ref: '#/components/schemas/HistoricalGranularity' }
+        range: { $ref: '#/components/schemas/HistoricalTimeRange' }
+        fromTimestamp: { type: integer, description: 'Unix seconds.' }
+        toTimestamp: { type: integer, description: 'Unix seconds.' }
+        isCached: { type: boolean }
+        lastFetchedAt: { type: integer, description: 'Unix ms.' }
+        expiresAt: { type: integer, description: 'Unix ms.' }
+
+    TransactionHistoryItem:
+      type: object
+      required:
+        [timestamp, eventType, assetAmountRaw, assetSymbol, decimals, chainId, transactionHash]
+      properties:
+        timestamp: { type: integer, description: 'Unix seconds.' }
+        eventType: { type: string, example: deposit }
+        assetAmountRaw: { type: string, description: 'Amount in token base units.' }
+        assetSymbol: { type: string }
+        decimals: { type: integer }
+        assetLogo: { type: string, format: uri }
+        inputAssetAmountRaw: { type: string }
+        inputAssetSymbol: { type: string }
+        inputAssetDecimals: { type: integer }
+        inputAssetLogo: { type: string, format: uri }
+        outputAssetAmountRaw: { type: string }
+        outputAssetSymbol: { type: string }
+        outputAssetDecimals: { type: integer }
+        outputAssetLogo: { type: string, format: uri }
+        chainId: { $ref: '#/components/schemas/EarnChainId' }
+        transactionHash: { type: string, example: '0x...' }
+
+    PendingHistoryTemplate:
+      type: object
+      description: |
+        A pending-transaction template returned with a quote. Equivalent to
+        `TransactionHistoryItem` minus `timestamp` and `transactionHash`,
+        which the client fills in after the transaction is submitted.
+      required: [eventType, assetAmountRaw, assetSymbol, decimals, chainId]
+      properties:
+        eventType: { type: string, example: deposit }
+        assetAmountRaw: { type: string, description: 'Amount in token base units.' }
+        assetSymbol: { type: string }
+        decimals: { type: integer }
+        assetLogo: { type: string, format: uri }
+        inputAssetAmountRaw: { type: string }
+        inputAssetSymbol: { type: string }
+        inputAssetDecimals: { type: integer }
+        inputAssetLogo: { type: string, format: uri }
+        outputAssetAmountRaw: { type: string }
+        outputAssetSymbol: { type: string }
+        outputAssetDecimals: { type: integer }
+        outputAssetLogo: { type: string, format: uri }
+        chainId: { $ref: '#/components/schemas/EarnChainId' }
+
+    TransactionHistoryResponse:
+      type: object
+      required: [opportunityId, category, vendor, userAddress, transactions, total]
+      properties:
+        opportunityId: { type: string }
+        category: { $ref: '#/components/schemas/OpportunityCategory' }
+        vendor: { $ref: '#/components/schemas/Vendor' }
+        userAddress: { $ref: '#/components/schemas/EthAddress' }
+        transactions:
+          type: array
+          items: { $ref: '#/components/schemas/TransactionHistoryItem' }
+        total: { type: integer }
+        cachedAt: { type: integer, description: 'Unix ms.' }
+        expiresAt: { type: integer, description: 'Unix ms.' }
+
+    TokenContextItem:
+      type: object
+      required: [decimals, symbol, address]
+      properties:
+        decimals: { type: integer }
+        symbol: { type: string }
+        address: { $ref: '#/components/schemas/EthAddress' }
+        balanceNative: { type: string, description: 'Balance in token base units.' }
+        balanceUsd: { type: string }
+
+    TransactionContext:
+      type: object
+      required: [asset, lpToken]
+      properties:
+        asset: { $ref: '#/components/schemas/TokenContextItem' }
+        lpToken: { $ref: '#/components/schemas/TokenContextItem' }
+
+    RolloverTarget:
+      type: object
+      required: [id, tokenSymbol, ptTokenAddress, impliedApy]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        tokenSymbol: { type: string }
+        ptTokenAddress: { $ref: '#/components/schemas/EthAddress' }
+        ptTokenDecimals: { type: integer }
+        ptTokenIcon: { type: string, format: uri }
+        expiry: { type: string, description: 'ISO-8601 date.' }
+        impliedApy: { type: [number, 'null'] }
+
+    AvailableActions:
+      type: object
+      required: [opportunityId, vendor, userAddress, availableActions, transactionContext]
+      properties:
+        opportunityId: { type: string }
+        vendor: { $ref: '#/components/schemas/Vendor' }
+        userAddress: { $ref: '#/components/schemas/EthAddress' }
+        availableActions:
+          type: array
+          items: { $ref: '#/components/schemas/EarnTransactionAction' }
+        transactionContext:
+          oneOf:
+            - $ref: '#/components/schemas/TransactionContext'
+            - type: 'null'
+        rolloverTargets:
+          type: array
+          description: Present for `fixed-yield` opportunities — rollover destinations.
+          items: { $ref: '#/components/schemas/RolloverTarget' }
+
+    TransactionStep:
+      type: object
+      required: [step, type, to, data, chainId]
+      properties:
+        step: { type: integer, example: 1 }
+        type: { type: string, enum: [approval, transaction] }
+        to: { $ref: '#/components/schemas/EthAddress' }
+        data: { type: string, description: '0x-prefixed calldata.' }
+        value: { type: string, description: 'Wei value as decimal string.' }
+        chainId: { type: integer }
+        description: { type: string }
+
+    TransactionDetailsTemplate:
+      type: object
+      required: [amount, tokenSymbol, decimals, chainId]
+      properties:
+        amount: { type: string }
+        tokenSymbol: { type: string }
+        decimals: { type: integer }
+        assetLogo: { type: string, format: uri }
+        chainId: { $ref: '#/components/schemas/EarnChainId' }
+        protocolName: { type: string }
+        protocolLogo: { type: string, format: uri }
+        opportunityName: { type: string }
+
+    TransactionQuoteResponse:
+      type: object
+      required:
+        [opportunityId, vendor, action, canExecute, estimatedGas, estimatedGasUsd, transactionSteps]
+      properties:
+        opportunityId: { type: string }
+        vendor: { $ref: '#/components/schemas/Vendor' }
+        action: { $ref: '#/components/schemas/EarnTransactionAction' }
+        canExecute: { type: boolean }
+        estimatedGas: { type: string, description: 'Estimated gas units as decimal string.' }
+        estimatedGasUsd:
+          type: string
+          description: Estimated gas cost in USD as a raw decimal string (no currency symbol).
+        receiveAmount:
+          type: string
+          description: Expected output amount in the output token's base units.
+        priceImpact: { type: number, description: 'Price impact as a decimal (0.01 = 1%).' }
+        transactionSteps:
+          type: array
+          items: { $ref: '#/components/schemas/TransactionStep' }
+        transactionDetailsTemplate:
+          $ref: '#/components/schemas/TransactionDetailsTemplate'
+        pendingHistoryTemplate:
+          $ref: '#/components/schemas/PendingHistoryTemplate'
+
+    ErrorResponse:
+      type: object
+      required: [message, code]
+      properties:
+        message: { type: string, example: 'minTvl must be >= 0' }
+        code: { type: string, example: INVALID_MIN_TVL }
+
+  responses:
+    ValidationError:
+      description: A path or query parameter failed validation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFoundError:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
